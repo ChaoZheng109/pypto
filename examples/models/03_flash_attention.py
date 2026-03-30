@@ -23,8 +23,8 @@ Algorithm:
     Oi = update(Oi, pij @ Vj)
   Return Oi / li (final normalization)
 
-Run:  python examples/models/flash_attention.py
-Next: examples/models/paged_attention.py
+Run:  python examples/models/03_flash_attention.py
+Next: examples/models/04_paged_attention.py
 """
 
 import pypto.language as pl
@@ -121,4 +121,5 @@ def flash_attn(
     return attn_final
 
 
-print(flash_attn)
+if __name__ == "__main__":
+    print(flash_attn)
