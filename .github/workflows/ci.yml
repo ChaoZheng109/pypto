@@ -112,8 +112,8 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.18
-          PTOAS_SHA256=e61022d990e3142084529621d21ae10ca1aeea86c25fe6ba46222c61060f40af
+          PTOAS_VERSION=v0.24
+          PTOAS_SHA256=31a1f14767f23f0e530faeea0b0dea481ec22c09f9bee5045287b444df00b5bd
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
              -o /tmp/ptoas-bin-aarch64.tar.gz
@@ -133,12 +133,12 @@ jobs:
           pip install -v .
 
       - name: Test system tests
-        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=128 --pto-isa-commit=882c4db
+        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=128 --pto-isa-commit=38fcfb17
 
       - name: Test swimlane output
         run: |
           pytest tests/st/runtime/test_perf_swimlane.py \
-            -v --device=$DEVICE_ID --platform=a2a3 --enable-profiling --forked --pto-isa-commit=882c4db
+            -v --device=$DEVICE_ID --platform=a2a3 --enable-profiling --forked --pto-isa-commit=38fcfb17
 
   system-tests-a5sim:
     runs-on: ubuntu-latest
@@ -177,7 +177,7 @@ jobs:
           pip install -v .
 
       - name: Test A5 system tests (simulator)
-        run: pytest tests/st -v --platform a5sim --forked --pto-isa-commit=882c4db -m a5
+        run: pytest tests/st -v --platform a5sim --forked --pto-isa-commit=38fcfb17 -m a5
 
   fuzz-tests-sim:
     runs-on: ubuntu-latest
