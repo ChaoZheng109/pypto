@@ -83,6 +83,12 @@ inline const PassProperties kConvertTensorToTileOpsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure}};
 
+// -- Orchestration tensor optimization pass -----------------------------------
+
+inline const PassProperties kOptimizeOrchTensorsProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps},
+    .produced = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps}};
+
 // -- Tile ND-to-2D flattening pass --------------------------------------------
 
 inline const PassProperties kFlattenTileNdTo2DProperties{
