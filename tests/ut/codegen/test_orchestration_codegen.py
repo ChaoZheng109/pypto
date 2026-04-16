@@ -848,7 +848,7 @@ class TestOrchestration:
 
         # tensor.slice generates array variables and runtime .view() call with dynamic offset
         assert "uint32_t chunk_shapes[2] = {16, 16};" in code
-        assert "uint32_t chunk_offsets[2] = {(i * 16), 0};" in code
+        assert "uint32_t chunk_offsets[2] = {static_cast<uint32_t>((i * 16)), 0};" in code
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
         # tensor.read generates host pointer access
