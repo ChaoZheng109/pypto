@@ -33,8 +33,7 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/pto/tile_buf_signature.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -48,6 +47,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/ir_property.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
@@ -170,7 +170,7 @@ class MemRefUsageCollector : public IRVisitor {
 // -------------------------------------------------------------------------
 
 bool NeedsAscend910BSplitLoadTpopHazardWorkaround(const FunctionPtr& func) {
-  if (backend::GetBackendType() != backend::BackendType::Ascend910B ||
+  if (!PassContext::Current()->GetBackendHandler()->RequiresSplitLoadTpopWorkaround() ||
       func->func_type_ != FunctionType::AIV) {
     return false;
   }
