@@ -24,6 +24,9 @@ Auto-selects between tensor and tile implementation based on input type.
 | `matmul_acc` | `(acc: T, lhs: T, rhs: T, a_trans=False, b_trans=False) -> T` | Matrix multiply with accumulation: `acc += lhs @ rhs` |
 | `row_max` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise max (tile path requires `tmp_tile`) |
 | `row_sum` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise sum (tile path requires `tmp_tile`) |
+| `col_sum` | `(input: Tile, tmp_tile: Tile) -> Tile` | Column-wise sum (tile-only, requires `tmp_tile`) |
+| `col_max` | `(input: Tile) -> Tile` | Column-wise max (tile-only) |
+| `col_min` | `(input: Tile) -> Tile` | Column-wise min (tile-only) |
 | `rsqrt` | `(input: T, high_precision: bool = False) -> T` | Reciprocal square root; `high_precision=True` selects the high-precision path (tensor input only — tile callers must use `pl.tile.rsqrt(src, tmp=...)`) |
 | `create` / `create_tile` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem) -> Tile` | Tile-only (promoted from `pl.tile.create`): create tile at specific memory space |
 | `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices (dispatched by source type). Sugar: `A[i, j]` |
@@ -131,6 +134,9 @@ Transfer data between memory hierarchy levels.
 | `row_max` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise max (requires tmp buffer) |
 | `row_sum` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise sum (requires tmp buffer) |
 | `row_min` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise min (requires tmp buffer) |
+| `col_sum` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise sum (requires tmp buffer) |
+| `col_max` | `(tile: Tile) -> Tile` | Column-wise max |
+| `col_min` | `(tile: Tile) -> Tile` | Column-wise min |
 | `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | Sum along axis |
 | `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Max along axis |
 | `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Min along axis |
