@@ -77,6 +77,447 @@ class VarUseCollector : public IRVisitor {
   }
 };
 
+// ============================================================================
+// Top-down target retargeting
+//
+// Walks nested control flow (ForStmt -> IfStmt -> branches) and, for each
+// ForStmt's iter_arg / return_var chain, pushes the canonical target MemRef
+// (= initValue's MemRef, established by InitMemRef) down through the yield
+// graph. Producers along the chain are rewritten to land on the target:
+//
+//   - Unconstrained producers (plain matmul, move, etc.): retyped to write
+//     directly to the target MemRef.
+//   - Pinned producers (set_output_reuses_input, e.g. matmul_acc): we cannot
+//     change their output MemRef, so we recurse onto the pinned-input var
+//     and try to place that upstream.
+//   - IfStmt return_vars: recurse into both branches' yield values with the
+//     same target, and retype the return_var itself.
+//
+// Liveness check: a retype at AssignStmt S is only safe if target's base Ptr
+// is not read between S and the enclosing ForStmt's yield.  The check walks
+// S's full ancestor chain (innermost out), and at each enclosing SeqStmts
+// scans the siblings that execute after the current walk node.  That covers
+// reads inside the same branch, reads after a nested IfStmt in the parent
+// body, and so on up to the enclosing ForStmt — where the retyped value is
+// consumed.
+//
+// Complexity: the retargeter runs a single IR walk to build the def map
+// (O(N)), then one TryRetargetVar per ForStmt iter_arg plus recursion into
+// IfStmt branches.  The liveness check scans the tail of each enclosing
+// SeqStmts up to the owning ForStmt; in the worst case of a deep linear
+// chain this is O(N^2).  In practice body tails are short (matmul/
+// accumulator loops have a handful of producers each), so the realised
+// cost is well below that bound; we accept the super-linear worst case
+// rather than threading a precomputed "bases read at-or-after" index that
+// would complicate the pass for no measurable win on typical IR.
+// ============================================================================
+
+/// Describes where a TileType Var is defined.
+struct VarDef {
+  enum Kind { kAssign, kIfReturn, kForReturn, kIterArg, kUnknown };
+  Kind kind = kUnknown;
+  StmtPtr assign_stmt;    // AssignStmt (for kAssign)
+  StmtPtr control_stmt;   // IfStmt/ForStmt (for kIfReturn/kForReturn)
+  size_t return_idx = 0;  // index into return_vars_ (for kIfReturn/kForReturn)
+  IterArgPtr iter_arg;    // for kIterArg
+  // Full chain of enclosing stmts from outermost to innermost (does *not*
+  // include the assign_stmt itself).  Populated for kAssign defs and used
+  // by the liveness check to walk up through nested IfStmt branches to the
+  // enclosing ForStmt's body.
+  std::vector<StmtPtr> ancestors;
+};
+
+/// Walks the IR once to build the def map, recording every AssignStmt's full
+/// enclosing-stmt chain so the liveness check can walk up past IfStmt /
+/// ScopeStmt branches into the enclosing loop body.
+class DefMapVisitor : public IRVisitor {
+ public:
+  std::map<VarPtr, VarDef> defs;
+
+  void Run(const StmtPtr& body) { VisitStmt(body); }
+
+ protected:
+  // Generic: every stmt becomes an ancestor of its children.  We push on
+  // enter and pop on exit so per-def ancestor snapshots are correct.
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (!stmt) return;
+    IRVisitor::VisitStmt(stmt);
+  }
+
+  void VisitStmt_(const SeqStmtsPtr& op) override {
+    ancestor_stack_.push_back(op);
+    for (const auto& s : op->stmts_) VisitStmt(s);
+    ancestor_stack_.pop_back();
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (As<TileType>(op->var_->GetType())) {
+      VarDef d;
+      d.kind = VarDef::kAssign;
+      d.assign_stmt = op;
+      d.ancestors = ancestor_stack_;
+      defs[op->var_] = d;
+    }
+    if (op->value_) VisitExpr(op->value_);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& rv = op->return_vars_[i];
+      if (!As<TileType>(rv->GetType())) continue;
+      VarDef d;
+      d.kind = VarDef::kIfReturn;
+      d.control_stmt = op;
+      d.return_idx = i;
+      defs[rv] = d;
+    }
+    ancestor_stack_.push_back(op);
+    VisitStmt(op->then_body_);
+    if (op->else_body_.has_value()) VisitStmt(op->else_body_.value());
+    ancestor_stack_.pop_back();
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      auto ia = op->iter_args_[i];
+      if (!As<TileType>(ia->GetType())) continue;
+      VarDef d;
+      d.kind = VarDef::kIterArg;
+      d.control_stmt = op;
+      d.return_idx = i;
+      d.iter_arg = ia;
+      defs[std::static_pointer_cast<const Var>(ia)] = d;
+    }
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& rv = op->return_vars_[i];
+      if (!As<TileType>(rv->GetType())) continue;
+      VarDef d;
+      d.kind = VarDef::kForReturn;
+      d.control_stmt = op;
+      d.return_idx = i;
+      defs[rv] = d;
+    }
+    ancestor_stack_.push_back(op);
+    VisitStmt(op->body_);
+    ancestor_stack_.pop_back();
+  }
+
+  // Scope statements (InCore/AutoInCore/Cluster/Hierarchy/Spmd) must also
+  // participate in the ancestor chain.  Without them, the liveness walk
+  // would jump straight from a scope body's SeqStmts to the enclosing
+  // loop body SeqStmts without finding its path-child, and reads after
+  // the scope in the enclosing body would be missed.
+  void VisitStmt_(const InCoreScopeStmtPtr& op) override { VisitScope(op, op->body_); }
+  void VisitStmt_(const AutoInCoreScopeStmtPtr& op) override { VisitScope(op, op->body_); }
+  void VisitStmt_(const ClusterScopeStmtPtr& op) override { VisitScope(op, op->body_); }
+  void VisitStmt_(const HierarchyScopeStmtPtr& op) override { VisitScope(op, op->body_); }
+  void VisitStmt_(const SpmdScopeStmtPtr& op) override { VisitScope(op, op->body_); }
+
+ private:
+  template <typename ScopeStmtPtrT>
+  void VisitScope(const ScopeStmtPtrT& op, const StmtPtr& body) {
+    ancestor_stack_.push_back(op);
+    VisitStmt(body);
+    ancestor_stack_.pop_back();
+  }
+
+  // Outermost-first stack of enclosing stmts during the walk.
+  std::vector<StmtPtr> ancestor_stack_;
+};
+
+/// Visits a stmt subtree and collects the MemRef base Ptrs of every *read*
+/// of a TileType Var.  Writes (the LHS of an AssignStmt) are intentionally
+/// excluded; every other stmt/expression kind dispatches through the default
+/// IRVisitor traversal, so new stmt types are covered automatically.
+class SubtreeReadBaseCollector : public IRVisitor {
+ public:
+  std::set<const Var*> bases;
+
+  void VisitExpr_(const VarPtr& var) override {
+    if (auto tile = GetTileTypeWithMemRef(var->GetType())) {
+      bases.insert(GetDefinedMemRef(tile)->base_.get());
+    }
+    IRVisitor::VisitExpr_(var);
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // Skip op->var_ — the LHS is a definition, not a read.
+    if (op->value_) VisitExpr(op->value_);
+  }
+};
+
+inline bool SubtreeReadsBase(const StmtPtr& stmt, const Var* target_base) {
+  if (!stmt) return false;
+  SubtreeReadBaseCollector c;
+  c.VisitStmt(stmt);
+  return c.bases.count(target_base) > 0;
+}
+
+/// Plans top-down retypes. Produces (old Var -> new Type) map.
+class TopDownRetargeter {
+ public:
+  /// Runs the analysis. Returns map: old VarPtr -> new Type (with target MemRef).
+  std::map<VarPtr, TypePtr> Compute(const StmtPtr& func_body) {
+    DefMapVisitor def_v;
+    def_v.Run(func_body);
+    defs_ = std::move(def_v.defs);
+    VisitForStmts(func_body);
+    return std::move(rewrites_);
+  }
+
+ private:
+  std::map<VarPtr, VarDef> defs_;
+  std::map<VarPtr, TypePtr> rewrites_;
+  std::set<VarPtr> visiting_;  // cycle guard
+
+  // Walk IR, calling Propagate for each ForStmt we encounter.
+  void VisitForStmts(const StmtPtr& stmt) {
+    if (!stmt) return;
+    if (auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& s : seq->stmts_) VisitForStmts(s);
+    } else if (auto for_stmt = As<ForStmt>(stmt)) {
+      PropagateFromForStmt(for_stmt);
+      VisitForStmts(for_stmt->body_);
+    } else if (auto if_stmt = As<IfStmt>(stmt)) {
+      VisitForStmts(if_stmt->then_body_);
+      if (if_stmt->else_body_.has_value()) VisitForStmts(if_stmt->else_body_.value());
+    } else if (auto scope = As<ScopeStmt>(stmt)) {
+      VisitForStmts(scope->body_);
+    }
+  }
+
+  void PropagateFromForStmt(const ForStmtPtr& for_stmt) {
+    if (for_stmt->iter_args_.empty()) return;
+    auto yield = FindYieldStmt(for_stmt->body_);
+    if (!yield) return;
+
+    for (size_t i = 0; i < for_stmt->iter_args_.size() && i < yield->value_.size(); ++i) {
+      auto ia = for_stmt->iter_args_[i];
+      auto ia_tile = GetTileTypeWithMemRef(ia->GetType());
+      if (!ia_tile) continue;
+      auto target_memref = GetDefinedMemRef(ia_tile);
+      auto target_memory = ia_tile->GetMemorySpace();
+
+      auto yield_var = As<Var>(yield->value_[i]);
+      if (!yield_var) continue;
+
+      TryRetargetVar(yield_var, target_memref, target_memory);
+    }
+  }
+
+  /// Current (possibly-rewritten) MemRef base of `var`.
+  const Var* CurrentBase(const VarPtr& var) {
+    auto it = rewrites_.find(var);
+    auto type = (it != rewrites_.end()) ? it->second : var->GetType();
+    auto tile = GetTileTypeWithMemRef(type);
+    if (!tile) return nullptr;
+    return GetDefinedMemRef(tile)->base_.get();
+  }
+
+  /// Attempts to rewrite `var`'s MemRef to `target` by walking its producer chain.
+  /// Returns true if var already has target MemRef or a rewrite was planned.
+  bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory) {
+    if (CurrentBase(var) == target->base_.get()) return true;  // already aligned
+    if (!visiting_.insert(var).second) return false;           // cycle
+    struct Guard {
+      std::set<VarPtr>* s;
+      VarPtr v;
+      ~Guard() { s->erase(v); }
+    } g{&visiting_, var};
+
+    auto it = defs_.find(var);
+    if (it == defs_.end()) return false;
+    const auto& def = it->second;
+
+    if (def.kind == VarDef::kAssign) {
+      return RetargetAssign(var, def, target, target_memory);
+    }
+    if (def.kind == VarDef::kIfReturn) {
+      return RetargetIfReturn(var, def, target, target_memory);
+    }
+    // kIterArg / kForReturn / kUnknown: can't retarget directly.
+    return false;
+  }
+
+  /// Retype a Var defined by an AssignStmt.
+  bool RetargetAssign(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
+                      std::optional<MemorySpace> target_memory) {
+    auto assign = As<AssignStmt>(def.assign_stmt);
+    INTERNAL_CHECK(assign) << "Internal error: kAssign VarDef must carry an AssignStmt";
+    auto call = As<Call>(assign->value_);
+    if (!call) return false;
+    const auto& reg = OpRegistry::GetInstance();
+    if (!reg.IsRegistered(call->op_->name_)) return false;
+    const auto& entry = reg.GetEntry(call->op_->name_);
+
+    auto reuse_idx = entry.GetOutputReusesInputArg();
+    if (reuse_idx.has_value()) {
+      // Pinned output: can't change this stmt's LHS MemRef; recurse onto pinned input.
+      if (*reuse_idx >= call->args_.size()) return false;
+      auto input_var = As<Var>(call->args_[*reuse_idx]);
+      if (!input_var) return false;
+      if (!TryRetargetVar(input_var, target, target_memory)) return false;
+      // Also record that `var`'s MemRef should follow the pinned input to target.
+      PlanRewrite(var, target, target_memory);
+      return true;
+    }
+
+    // Decline retargeting for ops whose output memory is not fully captured
+    // by the LHS type alone:
+    //   1. View ops (set_output_memory_inherit_input) — output MemRef
+    //      inherits the input's view byte_offset_ / size_, which rewriting
+    //      with target's full MemRef would silently drop.
+    //   2. Ops that encode output memory in a `target_memory` kwarg (e.g.
+    //      tile.move / tile.load) — retyping the LHS without also rewriting
+    //      the kwarg leaves the call self-inconsistent.
+    //   3. Ops registered `not_inplace_safe()` (e.g. tile.mrgsort_format1)
+    //      whose implementation requires src buffer != dst buffer.  If any
+    //      input of the call already lives on `target_base`, retyping the
+    //      output onto the same buffer creates an in-place execution that
+    //      the op cannot handle and fails at runtime.
+    if (IsOutputMemoryInheritInput(entry)) return false;
+    if (HasKwarg(*call, "target_memory")) return false;
+    if (!entry.IsInplaceSafe() && CallReadsBase(*call, target->base_.get())) return false;
+
+    // Unconstrained: check liveness, then plan retype.
+    if (!IsTargetDeadAtAssign(def, target->base_.get())) return false;
+    PlanRewrite(var, target, target_memory);
+    return true;
+  }
+
+  /// True if any argument of the call is a TileType Var whose MemRef base
+  /// is `target_base`.  Used to detect would-be in-place execution before
+  /// we retype the output onto the same buffer.
+  static bool CallReadsBase(const Call& call, const Var* target_base) {
+    SubtreeReadBaseCollector c;
+    for (const auto& arg : call.args_) c.VisitExpr(arg);
+    return c.bases.count(target_base) > 0;
+  }
+
+  /// True when the op is registered with set_output_memory_inherit_input:
+  /// the memory spec exists, has no output_reuses_input_arg, and its
+  /// deduce_output_memory lambda returns nullopt for empty kwargs (the
+  /// signature the inherit-input registration leaves behind).
+  static bool IsOutputMemoryInheritInput(const OpRegistryEntry& entry) {
+    const auto& spec = entry.GetMemorySpec();
+    if (!spec.has_value()) return false;
+    if (spec->output_reuses_input_arg.has_value()) return false;
+    if (!spec->deduce_output_memory) return false;
+    return !spec->deduce_output_memory({}).has_value();
+  }
+
+  static bool HasKwarg(const Call& call, const std::string& key) {
+    for (const auto& [k, _] : call.kwargs_) {
+      if (k == key) return true;
+    }
+    return false;
+  }
+
+  /// Retype an IfStmt return_var: recurse into both branches' yield values.
+  bool RetargetIfReturn(const VarPtr& var, const VarDef& def, const MemRefPtr& target,
+                        std::optional<MemorySpace> target_memory) {
+    auto if_stmt = As<IfStmt>(def.control_stmt);
+    if (!if_stmt) return false;
+    size_t idx = def.return_idx;
+
+    auto visit_branch = [&](const StmtPtr& body) -> bool {
+      auto y = FindYieldStmt(body);
+      if (!y || idx >= y->value_.size()) return false;
+      auto yv = As<Var>(y->value_[idx]);
+      if (!yv) return false;
+      return TryRetargetVar(yv, target, target_memory);
+    };
+
+    bool then_ok = visit_branch(if_stmt->then_body_);
+    bool else_ok = if_stmt->else_body_.has_value() ? visit_branch(if_stmt->else_body_.value()) : true;
+    if (!then_ok || !else_ok) return false;
+
+    PlanRewrite(var, target, target_memory);
+    return true;
+  }
+
+  void PlanRewrite(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory) {
+    auto new_type = CloneTypeWithMemRef(var->GetType(), target, target_memory);
+    rewrites_[var] = new_type;
+  }
+
+  /// Is target's base Ptr unread between the AssignStmt and the end of its containing body?
+  /// Also walks into nested control flow to check for reads there.
+  /// Liveness check: walks the AssignStmt's full ancestor chain from innermost
+  /// outward and, at every enclosing SeqStmts, scans the siblings that execute
+  /// after the AssignStmt for reads of `target_base`.  Walking continues past
+  /// IfStmt branches into the parent body so reads that appear after a nested
+  /// IfStmt (but still within the enclosing ForStmt's body) are detected.  The
+  /// walk stops at the first enclosing ForStmt — reads outside the loop body
+  /// cannot observe the retyped value, which is consumed at the loop yield.
+  bool IsTargetDeadAtAssign(const VarDef& def, const Var* target_base) {
+    if (def.ancestors.empty()) return true;
+
+    // `child_on_path` is the direct descendant of the current ancestor that
+    // lies on the walk path toward the AssignStmt.  We update it as we step
+    // outward so that, at each SeqStmts level, we can locate it in stmts_.
+    StmtPtr child_on_path = def.assign_stmt;
+
+    for (auto it = def.ancestors.rbegin(); it != def.ancestors.rend(); ++it) {
+      const auto& anc = *it;
+
+      if (auto seq = As<SeqStmts>(anc)) {
+        auto pos = std::find(seq->stmts_.begin(), seq->stmts_.end(), child_on_path);
+        if (pos != seq->stmts_.end()) {
+          for (++pos; pos != seq->stmts_.end(); ++pos) {
+            if (SubtreeReadsBase(*pos, target_base)) return false;
+          }
+        }
+      }
+
+      // Stop once we've scanned the body of the enclosing ForStmt: the
+      // retyped value is consumed by that loop's yield, so anything outside
+      // the loop cannot observe it.
+      if (As<ForStmt>(anc)) return true;
+
+      child_on_path = anc;
+    }
+    return true;
+  }
+};
+
+/// Applies planned retypes to the IR.
+class RetypeApplier : public IRMutator {
+ public:
+  explicit RetypeApplier(std::map<VarPtr, TypePtr> rewrites) : rewrites_(std::move(rewrites)) {}
+
+  ExprPtr VisitExpr_(const VarPtr& op) override {
+    auto it = var_substitution_.find(op);
+    if (it != var_substitution_.end()) return it->second;
+    return op;
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto rit = rewrites_.find(op->var_);
+    if (rit != rewrites_.end()) {
+      auto new_var = std::make_shared<Var>(op->var_->name_hint_, rit->second, op->var_->span_);
+      var_substitution_[op->var_] = new_var;
+    }
+    return IRMutator::VisitStmt_(op);
+  }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    // Pre-register substitutions for any retargeted return_var; the default
+    // IRMutator IfStmt handler will then pick them up through VisitExpr_(Var).
+    for (const auto& rv : op->return_vars_) {
+      auto rit = rewrites_.find(rv);
+      if (rit != rewrites_.end()) {
+        var_substitution_[rv] = std::make_shared<Var>(rv->name_hint_, rit->second, rv->span_);
+      }
+    }
+    return IRMutator::VisitStmt_(op);
+  }
+
+ private:
+  std::map<VarPtr, TypePtr> rewrites_;
+  std::map<VarPtr, VarPtr> var_substitution_;
+};
+
 /**
  * @brief Full IR tree walker for lifetime analysis.
  *
@@ -1017,8 +1458,21 @@ StmtPtr RemoveUnusedAllocStatements(const StmtPtr& body, const std::set<const Va
 FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   INTERNAL_CHECK(func) << "MemoryReusePass cannot run on null function";
 
+  // Step 0: Top-down retarget — propagate iter_arg/initValue MemRefs down the
+  // yield chain so accumulator producers land directly in the canonical buffer.
+  // This eliminates most accumulator-related move insertions downstream.
+  StmtPtr new_body = func->body_;
+  {
+    TopDownRetargeter retargeter;
+    auto rewrites = retargeter.Compute(new_body);
+    if (!rewrites.empty()) {
+      RetypeApplier applier(std::move(rewrites));
+      new_body = applier.VisitStmt(new_body);
+    }
+  }
+
   // Step 1: Compute lifetimes by walking full IR tree
-  auto analysis_result = ComputeLifetimes(func->body_);
+  auto analysis_result = ComputeLifetimes(new_body);
 
   if (analysis_result.lifetimes.empty()) {
     LOG_WARN << "No TileType variables found, skipping memory reuse";
@@ -1029,9 +1483,8 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   auto reuse_map = IdentifyReuseOpportunities(analysis_result.lifetimes);
 
   // Step 3: Apply MemRef sharing (skip if no reuse candidates)
-  StmtPtr new_body = func->body_;
   if (!reuse_map.empty()) {
-    new_body = ApplyMemRefSharing(func->body_, reuse_map, analysis_result.var_sharing_groups);
+    new_body = ApplyMemRefSharing(new_body, reuse_map, analysis_result.var_sharing_groups);
   }
 
   // Step 4: Fix ForStmt/IfStmt yield/return_var MemRef mismatches
