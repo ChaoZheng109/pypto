@@ -12,22 +12,47 @@
 Provides cross-rank concepts that complement the single-device DSL in
 ``pypto.language``. Communication-domain metadata (``ir.CommGroup`` /
 ``ir.WindowBuffer``) is **inferred** by the ``CollectCommGroups`` pass from
-``pld.alloc_window_buffer`` calls in the host orchestrator and the
+``pld.tensor.alloc_window_buffer`` calls in the host orchestrator and the
 ``device=`` kwarg on dispatch sites; users do not declare ``CommGroup``
 manually.
 
-Package layout mirrors :mod:`pypto.language`:
+Package layout mirrors :mod:`pypto.language` (3-segment ``pld.<category>.<op>``
+plus 2-segment unified-dispatch short form, just like ``pl``):
 
-* :mod:`pypto.language.distributed.op` — parser-sentinel ops
-  (:func:`alloc_window_buffer`, :func:`window`, :func:`world_size`, plus
-  the ``tile`` sub-namespace for cross-rank tile ops such as
-  :func:`pld.tile.remote_load`). Per-file split mirrors the C++ side
-  (``src/ir/op/distributed/``).
+* :mod:`pypto.language.distributed.op` — parser-sentinel ops. Sub-namespaces:
+  ``pld.system.*`` (:func:`world_size`, :func:`get_comm_ctx`, :func:`rank`,
+  :func:`nranks`), ``pld.tensor.*`` (:func:`alloc_window_buffer`,
+  :func:`window`), and ``pld.tile.*`` (:func:`remote_load`). Per-file split
+  mirrors the C++ side (``src/ir/op/distributed/``).
 * :mod:`pypto.language.distributed.typing` — DSL type wrappers
-  (:class:`DistributedTensor`).
+  (:class:`DistributedTensor`, :class:`CommCtx`).
 """
 
-from .op import alloc_window_buffer, tile, window, world_size
-from .typing import DistributedTensor
+from .op import (
+    alloc_window_buffer,
+    get_comm_ctx,
+    nranks,
+    rank,
+    remote_load,
+    system,
+    tensor,
+    tile,
+    window,
+    world_size,
+)
+from .typing import CommCtx, DistributedTensor
 
-__all__ = ["DistributedTensor", "alloc_window_buffer", "tile", "window", "world_size"]
+__all__ = [
+    "CommCtx",
+    "DistributedTensor",
+    "alloc_window_buffer",
+    "get_comm_ctx",
+    "nranks",
+    "rank",
+    "remote_load",
+    "system",
+    "tensor",
+    "tile",
+    "window",
+    "world_size",
+]

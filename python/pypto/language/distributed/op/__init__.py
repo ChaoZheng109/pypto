@@ -7,21 +7,45 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Distributed-DSL op sentinels (``pld.<op>`` and ``pld.tile.<op>``).
+"""Distributed-DSL op sentinels — ``pld.<category>.<op>`` plus unified short form.
 
-Parser sentinels that lift to ``ir.OpExpr(pld.<op>)`` nodes. Files are
-grouped by op category (mirroring ``pypto.language.op``):
+Mirrors :mod:`pypto.language.op` for the distributed namespace: the
+3-segment surface (``pld.system.<op>`` / ``pld.tensor.<op>`` /
+``pld.tile.<op>``) is exposed as real Python sub-modules, while the
+2-segment short form (``pld.<op>``) is re-exported from
+:mod:`.unified_ops` via name-based dispatch.
 
-* ``memory_ops`` — :func:`alloc_window_buffer`, :func:`window` (CommGroup
-  window-buffer allocation and view materialisation).
-* ``system_ops`` — :func:`world_size` today; N6 will add
-  ``pld.system.notify`` / ``pld.system.wait`` here as well.
-* ``tile_ops`` — cross-rank tile ops, exposed as the ``tile`` sub-namespace
-  (``pld.tile.remote_load`` ...).
+Sub-modules (one per op category):
+
+* :mod:`.system_ops` — host queries and CommContext accessors
+  (``world_size``, ``get_comm_ctx``, ``rank``, ``nranks``).
+* :mod:`.tensor_ops` — CommGroup window-buffer allocation and view
+  materialisation (``alloc_window_buffer``, ``window``).
+* :mod:`.tile_ops` — cross-rank tile ops (``remote_load``, ...).
 """
 
+from . import system_ops as system
+from . import tensor_ops as tensor
 from . import tile_ops as tile
-from .memory_ops import alloc_window_buffer, window
-from .system_ops import world_size
+from .unified_ops import (
+    alloc_window_buffer,
+    get_comm_ctx,
+    nranks,
+    rank,
+    remote_load,
+    window,
+    world_size,
+)
 
-__all__ = ["alloc_window_buffer", "tile", "window", "world_size"]
+__all__ = [
+    "alloc_window_buffer",
+    "get_comm_ctx",
+    "nranks",
+    "rank",
+    "remote_load",
+    "system",
+    "tensor",
+    "tile",
+    "window",
+    "world_size",
+]

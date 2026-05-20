@@ -504,7 +504,7 @@ using TensorTypePtr = std::shared_ptr<const TensorType>;
 class DistributedTensorType : public TensorType {
  public:
   /// Optional back-reference to the :class:`WindowBuffer` whose allocation this
-  /// tensor is a view of. Populated by ``pld.window``'s type deducer;
+  /// tensor is a view of. Populated by ``pld.tensor.window``'s type deducer;
   /// ``std::nullopt`` for user-declared parameter annotations like
   /// ``pld.DistributedTensor[[shape], dtype]``. Two DistributedTensorTypes with
   /// the same shape / dtype but different ``window_buffer_`` values are
@@ -536,7 +536,7 @@ class DistributedTensorType : public TensorType {
                         std::optional<TensorView> tensor_view)
       : TensorType(shape, dtype, std::move(memref), std::move(tensor_view)), window_buffer_(std::nullopt) {}
 
-  /// Construct a DistributedTensorType produced by ``pld.window``: the result
+  /// Construct a DistributedTensorType produced by ``pld.tensor.window``: the result
   /// is paired with the originating :class:`WindowBuffer` so passes can recover
   /// the comm-group / slot identity later.
   DistributedTensorType(std::vector<ExprPtr> shape, DataType dtype, WindowBufferPtr window_buffer)
@@ -743,7 +743,7 @@ inline PtrTypePtr GetPtrType() {
 }
 
 /**
- * @brief Singleton marker type for ``pld.alloc_window_buffer`` results.
+ * @brief Singleton marker type for ``pld.tensor.alloc_window_buffer`` results.
  *
  * Carries no per-instance fields; all allocation metadata (size, host-staging
  * flags, etc.) lives on the :class:`WindowBuffer` Var subclass that the alloc
@@ -766,6 +766,37 @@ using WindowBufferTypePtr = std::shared_ptr<const WindowBufferType>;
 inline WindowBufferTypePtr GetWindowBufferType() {
   static const auto window_buffer_type = std::make_shared<WindowBufferType>();
   return window_buffer_type;
+}
+
+/**
+ * @brief Singleton marker type for ``pld.system.get_comm_ctx`` results.
+ *
+ * Represents the communication context of a window-bound
+ * :class:`DistributedTensorType` — the runtime ``CommContext`` struct from
+ * which scalar fields like ``rank`` / ``nranks`` are read.
+ *
+ * Carries no per-instance fields; the back-reference to the originating
+ * :class:`WindowBuffer` / :class:`CommGroup` is recovered at codegen time
+ * from the producing ``pld.system.get_comm_ctx`` argument's type. Cross-rank op
+ * verifiers dispatch on this marker (``As<CommCtxType>``) to reject
+ * non-CommCtx arguments to ``pld.system.rank`` / ``pld.system.nranks``.
+ */
+class CommCtxType : public Type {
+ public:
+  CommCtxType() = default;
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::CommCtxType; }
+  [[nodiscard]] std::string TypeName() const override { return "CommCtxType"; }
+
+  static constexpr auto GetFieldDescriptors() { return Type::GetFieldDescriptors(); }
+};
+
+using CommCtxTypePtr = std::shared_ptr<const CommCtxType>;
+
+/// Get the shared singleton CommCtxType instance.
+inline CommCtxTypePtr GetCommCtxType() {
+  static const auto comm_ctx_type = std::make_shared<CommCtxType>();
+  return comm_ctx_type;
 }
 
 }  // namespace ir
