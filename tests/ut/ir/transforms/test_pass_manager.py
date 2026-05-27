@@ -58,6 +58,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "DeriveCallDirections",
     "CollectCommGroups",
     "Simplify",
+    "MaterializeRuntimeScopes",
 ]
 
 DEBUG_TILE_OPTIMIZATION_PASSES = [
@@ -91,6 +92,7 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "DeriveCallDirections",
     "CollectCommGroups",
     "Simplify",
+    "MaterializeRuntimeScopes",
 ]
 
 
