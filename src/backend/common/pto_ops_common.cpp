@@ -3006,9 +3006,16 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("tile.cmp", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileCmpCodegenPTO("pto.tcmp", op, codegen);
   });
-  reg("tile.cast", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeTileCvtCodegenPTO("pto.tcvt", op, codegen);
-  });
+  // tile.cast (TCVT): pto.tcvt mis-orders elements on a col_major source, so per
+  // ISA the input and output must be row_major (see #1549).
+  if (exclude_ops.count("tile.cast") == 0) {
+    backend.RegisterOp("tile.cast")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTileCvtCodegenPTO("pto.tcvt", op, codegen);
+        })
+        .set_input_layout(0, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
+  }
   // tile.rsqrt accepts 1 arg (basic) or 2 args (high-precision with tmp workspace).
   // Both forms emit pto.trsqrt with the appropriate ins() arity. Per ISA, both
   // inputs (when present) and the output must be row_major.
