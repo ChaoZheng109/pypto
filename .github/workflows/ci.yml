@@ -75,8 +75,54 @@ jobs:
     - name: Test unit tests
       run: pytest tests/ut -n auto --maxprocesses 8 -v
 
+  codegen-tests:
+    # Codegen-only: verifies IR → kernel/orch C++ generation without going
+    # on-board. --codegen-only skips assembly (ptoas), pto-isa, simpler and
+    # device execution (see tests/st/harness/core/test_runner.py), so this
+    # runs on a CPU runner and never competes for NPU cards.
+    runs-on: [self-hosted, linux, arm64, cpu]
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: /root/.cache/ccache
+      CCACHE_MAXSIZE: 5G
+      PIP_CACHE_DIR: /root/.cache/pip
+    container:
+      image: localhost:5000/ci-py310:latest
+      options: >-
+        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache:/root/.cache/ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Show ccache stats (before)
+        run: ccache -s || true
+
+      - name: Install project and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install scikit-build-core nanobind cmake ninja
+          rm -rf ./build ./_skbuild
+          test ! -e ./build && test ! -e ./_skbuild && echo "OK: pypto build removed"
+          pip install --no-build-isolation .[dev]
+
+      - name: Show ccache stats (after)
+        run: ccache -s || true
+
+      - name: Test codegen (codegen-only, no device)
+        # test_torch_codegen_paged_attention does a numeric golden compare whose
+        # bf16/fp16 accumulation is sensitive to the host torch/BLAS build; it
+        # drifts past tolerance on this CPU container, so it runs in the npu
+        # system-tests job instead (it needs no device, only that environment).
+        run: >-
+          pytest tests/st/codegen -v --codegen-only
+          --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
+
   system-tests:
-    runs-on: [self-hosted, linux, arm64, npu-3-device]
+    runs-on: [self-hosted, linux, arm64, npu-1-device]
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
@@ -166,7 +212,14 @@ jobs:
 
       - name: Test system tests
         timeout-minutes: 15
-        run: pytest tests/st -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=2c607938 --ignore=tests/st/distributed
+        # tests/st/codegen is device-free and runs in the separate CPU
+        # codegen-tests job (--codegen-only). On-board execution tests
+        # (incl. the paged-attention pipelines) live under tests/st/runtime.
+        # test_torch_codegen_paged_attention is passed explicitly so it still
+        # runs here despite the tests/st/codegen ignore: its numeric golden
+        # compare is unstable on the CPU container's torch/BLAS build (see the
+        # codegen-tests job), so it needs this environment.
+        run: pytest tests/st tests/st/codegen/torch/test_torch_codegen_paged_attention.py -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=2c607938 --ignore=tests/st/distributed --ignore=tests/st/codegen
 
       - name: Test multi-orch L2 (isolated pytest invocation)
         # A ``Worker(level=2)`` device session currently leaves runtime
