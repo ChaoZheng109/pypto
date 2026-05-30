@@ -2304,12 +2304,11 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen);
 
   const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
-  const auto& offset_elems = offsets_tuple->elements_;
   const auto& shape_elems = shapes_tuple->elements_;
   std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      GetExprCodes(offset_elems, codegen), GetSizeCodes(shape_elems, codegen), codegen);
+      LowerTupleToIndexSSA(offsets_tuple, codegen), GetSizeCodes(shape_elems, codegen), codegen);
 
   std::string tile_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!tile_buf.empty(), op->span_)
@@ -2320,6 +2319,78 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   tload << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(" << tile_buf << " : "
         << tile_buf_type << ")";
   codegen.Emit(tload.str());
+  return "";
+}
+
+// pld.tile.remote_store(src_tile, target, peer, offsets) — write a local tile
+// into a peer's slice of a window-bound DistributedTensor. Lowers to:
+//   delems    = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
+//   peer_ptr  = pto.addptr local_ptr, delems
+//   peer_view = pto.make_tensor_view peer_ptr, shape=..., strides=...
+//   pto.partition_view peer_view, offsets=..., sizes=<tile.valid_shape padded
+//                                                     with leading 1s>
+//   pto.tstore ins(<tile>) outs(<pview>)
+//
+// The tile's valid_shape is 2-D (height, width); when target_rank > 2 the
+// leading (target_rank - 2) partition dims are size-1 — matching the
+// notify codegen's one_dims(rank, "1") pattern — so a 2-D tile push lands
+// on the inner two dims of an N-D peer slice without forcing the caller to
+// reshape.
+static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 4)
+      << "pld.tile.remote_store requires 4 arguments (src_tile, target, peer, offsets), got "
+      << op->args_.size();
+
+  auto src_tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK_SPAN(src_tile, op->span_) << "pld.tile.remote_store src_tile must be a Var or IterArg";
+  auto tile_type = As<ir::TileType>(src_tile->GetType());
+  INTERNAL_CHECK_SPAN(tile_type, op->span_) << "pld.tile.remote_store src_tile must have TileType";
+
+  auto binding = ResolveDistTensorBinding(op->args_[1], codegen, "pld.tile.remote_store");
+  auto offsets_tuple = As<ir::MakeTuple>(op->args_[3]);
+  INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.tile.remote_store offsets must be MakeTuple";
+
+  auto peer_view = EmitCommRemoteView(binding, op->args_[2], codegen);
+  const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
+
+  const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+  const auto& valid_shape = tile_view.valid_shape;
+  INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_)
+      << "pld.tile.remote_store tile valid_shape must be 2D";
+  const size_t target_rank = binding.type->shape_.size();
+  INTERNAL_CHECK_SPAN(target_rank >= 2, op->span_)
+      << "pld.tile.remote_store target rank must be >= 2 to hold a 2-D tile";
+
+  std::vector<std::string> dim_strs(target_rank - 2, "1");
+  std::vector<std::string> size_codes(target_rank - 2,
+                                      codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX));
+  auto append_dim = [&](const ir::ExprPtr& expr) {
+    if (auto c = As<ir::ConstInt>(expr)) {
+      dim_strs.push_back(std::to_string(c->value_));
+    } else {
+      dim_strs.emplace_back("?");
+    }
+    size_codes.push_back(codegen.GetExprAsCode(expr));
+  };
+  append_dim(valid_shape[0]);
+  append_dim(valid_shape[1]);
+  const std::string partition_type = MakePartitionTensorViewType(dim_strs, dtype_str);
+
+  std::string partition_view =
+      EmitPartitionViewPTO(binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str,
+                           partition_type, LowerTupleToIndexSSA(offsets_tuple, codegen), size_codes, codegen);
+
+  std::string tile_buf = codegen.GetVarName(src_tile);
+  std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+
+  std::ostringstream tstore_line;
+  tstore_line << "pto.tstore ins(" << tile_buf;
+  if (!tile_buf_type.empty()) {
+    tstore_line << " : " << tile_buf_type;
+  }
+  tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
+  codegen.Emit(tstore_line.str());
   return "";
 }
 
@@ -2358,7 +2429,7 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+      LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: tnotify value's MLIR type must match the signal element
   // type. Emit using the value's own ScalarType — mismatched IR-level dtypes
@@ -2416,7 +2487,7 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view =
       EmitPartitionViewPTO(signal_var->name_hint_ + "_local", local_view, local_view_type, partition_type,
-                           GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+                           LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: twait expected value's MLIR type must match the signal
   // element type. Emit using the expected value's own ScalarType — see notify
@@ -2904,6 +2975,9 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   // (PyPTO compile-time static_asserts catch any CommContext ABI drift).
   reg("pld.tile.remote_load", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeRemoteLoadCodegenPTO(op, codegen);
+  });
+  reg("pld.tile.remote_store", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeRemoteStoreCodegenPTO(op, codegen);
   });
   reg("pld.system.notify",
       [](const ir::CallPtr& op, codegen::CodegenBase& codegen) { return MakeNotifyCodegenPTO(op, codegen); });
